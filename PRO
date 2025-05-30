@@ -5,7 +5,7 @@ import requests
 import pandas as pd
 import sqlite3
 import speedtest
-from datetime import datetime, timedelta, time as dt_time
+from datetime import datetime
 import alpaca_trade_api as tradeapi
 
 # CONFIG
@@ -16,9 +16,9 @@ TRADIER_TOKEN = os.getenv('TRADIER_TOKEN')
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_API_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
-symbols = ['RUN', 'SERV']
+symbols = ['SYTA', 'RUN', 'SERV', 'MARA']
 profit_target = 0.001
-stop_loss_pct = 0.004  # 0.4%
+stop_loss_pct = 0.004
 TRADE_VALUE_PER_TRADE = 5000
 LOOP_DELAY = 1.0
 in_trade_flags = {sym: threading.Event() for sym in symbols}
@@ -29,7 +29,7 @@ api = tradeapi.REST(API_KEY, API_SECRET, ALPACA_URL)
 # SQLite Setup
 conn = sqlite3.connect('trade_log.db', check_same_thread=False)
 cursor = conn.cursor()
-cursor.execute('''
+cursor.execute("""
 CREATE TABLE IF NOT EXISTS timothy_trade_logsv4 (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol TEXT NOT NULL,
@@ -47,14 +47,14 @@ CREATE TABLE IF NOT EXISTS timothy_trade_logsv4 (
     sell_reason TEXT,
     pnl REAL
 )
-''')
+""")
 conn.commit()
 
 def send_telegram_message(text):
     try:
         s = speedtest.Speedtest()
         ping = s.results.ping
-        msg = f"{text}\n📶 Latency: {ping:.2f} ms"
+        msg = f"{text}\nð¶ Latency: {ping:.2f} ms"
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg}
@@ -78,12 +78,11 @@ def get_tradier_timesales(sym):
 def get_indicators(sym):
     df = get_tradier_timesales(sym)
     if df.empty or 'close' not in df or 'volume' not in df:
-        return 0.0, 0.0, 0.0, False
+        return 0.0, 0.0, 0.0, 0.0, False
 
     df['pressure'] = df['close'] * df['volume']
     pressure = df['pressure'].pct_change().dropna().iloc[-1] if len(df) > 1 else 0.0
 
-    # MACD Histogram
     ema_12 = df['close'].ewm(span=12, adjust=False).mean()
     ema_26 = df['close'].ewm(span=26, adjust=False).mean()
     macd_line = ema_12 - ema_26
@@ -91,10 +90,11 @@ def get_indicators(sym):
     macd_hist = macd_line - signal
     macd_val = macd_hist.iloc[-1]
 
-    # Volume Spike
     vol_spike = int(df['volume'].iloc[-1] > 1.5 * df['volume'].iloc[-6:-1].mean()) if len(df) >= 6 else 0
+    strong_candle = int(df['close'].iloc[-1] > df['close'].iloc[-2]) if len(df) >= 2 else 0
 
-    return pressure, macd_val, vol_spike, True
+    return pressure, macd_val, vol_spike, strong_candle, True
+
 def get_quote(sym):
     try:
         r = requests.get(
@@ -112,13 +112,13 @@ def get_quote(sym):
 
 def log_trade(sym, entry_price, exit_price, qty, pressure, spread, macd_hist, volume_spike, sell_reason):
     pnl = (exit_price - entry_price) * qty
-    cursor.execute('''
+    cursor.execute("""
         INSERT INTO timothy_trade_logsv4 (
             symbol, entry_price, exit_price, position_size, side, status,
             entry_timestamp, exit_timestamp, pressure, spread,
             macd_hist, volume_spike, sell_reason, pnl
         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    ''', (
+    """, (
         sym, entry_price, exit_price, qty, 'buy', 'closed',
         datetime.utcnow().isoformat(), datetime.utcnow().isoformat(),
         pressure, spread, macd_hist, volume_spike, sell_reason, pnl
@@ -132,21 +132,21 @@ def place_and_monitor(sym):
         if not all([last, bid, ask]) or bid <= 0 or ask <= 0:
             return
 
-        pressure, macd_hist, vol_spike, valid = get_indicators(sym)
+        pressure, macd_hist, vol_spike, strong_candle, valid = get_indicators(sym)
         if not valid:
             return
         spread = ask - bid
 
-        # Conditions
         conds = {
             "pressure > 0.005": pressure > 0.005,
             "macd_hist > 0": macd_hist > 0,
             "vol_spike": vol_spike,
-            "spread ≤ 0.03": spread <= 0.03,
+            "spread â¤ 0.02": spread <= 0.02,
+            "candle close strong": strong_candle,
         }
 
-        print(f"[{sym}] Quote: {last:.3f} | Spread: {spread:.3f} | MACD: {macd_hist:.4f} | Pressure: {pressure:.4f} | Vol Spike: {bool(vol_spike)}")
-        print(" | ".join([f"{k} {'✔' if v else '✖'}" for k, v in conds.items()]))
+        print(f"[{sym}] Quote: {last:.3f} | Spread: {spread:.3f} | MACD: {macd_hist:.4f} | Pressure: {pressure:.4f} | Vol Spike: {bool(vol_spike)} | Strong Candle: {bool(strong_candle)}")
+        print(" | ".join([f"{k} {'â' if v else 'â'}" for k, v in conds.items()]))
 
         if not all(conds.values()):
             return
@@ -157,7 +157,7 @@ def place_and_monitor(sym):
         order_status = api.get_order(order.id)
         fill_px = float(order_status.filled_avg_price)
 
-        send_telegram_message(f"✅ BUY {sym} | {qty} @ {fill_px:.3f}")
+        send_telegram_message(f"â BUY {sym} | {qty} @ {fill_px:.3f}")
         print(f"[{sym}] Bought {qty} @ {fill_px:.3f}")
 
         target = round(fill_px + profit_target, 4)
@@ -182,7 +182,7 @@ def place_and_monitor(sym):
         sell_status = api.get_order(sell_order.id)
         sell_px = float(sell_status.filled_avg_price)
 
-        send_telegram_message(f"🔴 SELL {sym} | {qty} @ {sell_px:.3f} ({sell_reason})")
+        send_telegram_message(f"ð´ SELL {sym} | {qty} @ {sell_px:.3f} ({sell_reason})")
         log_trade(sym, fill_px, sell_px, qty, pressure, spread, macd_hist, vol_spike, sell_reason)
 
         pnl = (sell_px - fill_px) * qty
@@ -197,18 +197,16 @@ def run_trading_bot():
         if not in_trade_flags[sym].is_set():
             threading.Thread(target=place_and_monitor, args=(sym,)).start()
 
-# ─── MAIN LOOP ───────────────────────────────────────────────────────────────
+# MAIN LOOP
 if __name__ == '__main__':
-    print("🚀 Timothy Scalping Bot Ready")
-    send_telegram_message("🟢 Scalping Bot Online.")
+    print("ð Timothy Scalping Bot Ready")
+    send_telegram_message("ð¢ Scalping Bot Online.")
     try:
         while True:
-            now = datetime.now().time()
-            if dt_time(9, 30) <= now <= dt_time(15, 40):
-                run_trading_bot()
+            run_trading_bot()
             time.sleep(LOOP_DELAY)
     except KeyboardInterrupt:
-        print("👋 Bot stopped manually.")
-        send_telegram_message("🔴 Bot stopped manually.")
+        print("ð Bot stopped manually.")
+        send_telegram_message("ð´ Bot stopped manually.")
     finally:
         conn.close()
